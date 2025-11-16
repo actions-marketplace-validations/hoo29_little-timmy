@@ -1,8 +1,11 @@
 import logging
 import os
+import sys
+import types
 import yaml
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 
 from jinja2 import Environment
 from jsonschema import validate
@@ -21,9 +24,13 @@ except ImportError:
     VaultSecretsContext = None
     jinja2_defaults = None
     ANSIBLE_12_PLUS = False
-from ansible.plugins.loader import test_loader, Jinja2Loader
+from ansible.plugins.loader import test_loader, Jinja2Loader, init_plugin_loader
+import ansible_collections
 
 from .utils import get_items_in_folder
+
+# must be run only once
+init_plugin_loader()
 
 LOGGER = logging.getLogger("little-timmy")
 
@@ -189,6 +196,63 @@ class Context():
     root_dir: str
 
 
+def find_and_setup_galaxy_collections(root_dir: str, skip_dirs: list[str]) -> None:
+    """
+    Find all galaxy collections in the root directory and set them up for FQDN access.
+    Creates in-memory Python modules without modifying the filesystem.
+    """
+    # Look for galaxy.yml files which indicate a collection
+    galaxy_files = get_items_in_folder(
+        root_dir, f"{root_dir}/**/galaxy.yml", skip_dirs, include_ext=True, dirs_to_exclude=skip_dirs
+    )
+
+    for galaxy_file in galaxy_files:
+        collection_dir = Path(galaxy_file).parent
+
+        # Read galaxy.yml to get namespace and name
+        try:
+            with open(galaxy_file, "r") as f:
+                galaxy_info = yaml.safe_load(f)
+        except Exception as e:
+            LOGGER.debug(f"Error reading galaxy.yml at {galaxy_file}: {e}")
+            continue
+
+        namespace = galaxy_info.get("namespace")
+        name = galaxy_info.get("name")
+
+        if not namespace or not name:
+            continue
+
+        # Create in-memory Python modules for the collection
+        # This avoids modifying the filesystem while still allowing FQDN resolution
+        try:
+            # Create collection metadata
+            collection_meta = {
+                "name": f"{namespace}.{name}",
+                "version": galaxy_info.get("version", "1.0.0"),
+                "authors": galaxy_info.get("authors", []),
+                "description": galaxy_info.get("description", ""),
+                "plugin_routing": {},
+            }
+
+            # Create collection module (skip if already exists)
+            collection_module_name = f"ansible_collections.{namespace}.{name}"
+            if collection_module_name in sys.modules:
+                LOGGER.debug(
+                    f"Collection {namespace}.{name} already registered")
+                continue
+
+            collection_module = types.ModuleType(collection_module_name)
+            collection_module._collection_meta = collection_meta
+            collection_module.__path__ = [str(collection_dir.resolve())]
+            sys.modules[collection_module_name] = collection_module
+
+            LOGGER.debug(f"Registered in-memory collection {namespace}.{name}")
+        except Exception as e:
+            LOGGER.debug(
+                f"Error registering collection {namespace}.{name}: {e}")
+
+
 def setup_run(root_dir: str, absolute_path: str = "") -> Context:
 
     if not os.path.isdir(root_dir):
@@ -200,7 +264,7 @@ def setup_run(root_dir: str, absolute_path: str = "") -> Context:
     # Setup dataloader and vault
     loader = DataLoader()
     vault_ids = C.DEFAULT_VAULT_IDENTITY_LIST
-    
+
     # In ansible >= 12, VaultSecretsContext can only be initialized once
     # Check if it's already initialized before calling setup_vault_secrets
     if VaultSecretsContext is not None and VaultSecretsContext.current(optional=True):
@@ -208,14 +272,21 @@ def setup_run(root_dir: str, absolute_path: str = "") -> Context:
         vault_secrets = VaultSecretsContext.current().secrets
     else:
         # Not initialized yet (or ansible < 12), initialize it
-        vault_secrets = cli.CLI.setup_vault_secrets(loader, vault_ids=vault_ids)
-    
+        vault_secrets = cli.CLI.setup_vault_secrets(
+            loader, vault_ids=vault_ids)
+
     loader.set_vault_secrets(vault_secrets)
+
+    # Find galaxy collections and register them in-memory for FQDN access
+    # This allows FQDN filter names (e.g., namespace.collection.filter_name) to be resolved
+    # without modifying the filesystem
+    find_and_setup_galaxy_collections(root_dir, config.skip_dirs)
+
     # Setup jinja env
     plugin_folders = get_items_in_folder(
         root_dir, f"{root_dir}/**/filter_plugins", config.galaxy_dirs, True, config.skip_dirs, False)
     jinja_env = Environment()
-    
+
     # Create filter plugin loader
     filter_loader = Jinja2Loader(
         'FilterModule',
@@ -225,7 +296,7 @@ def setup_run(root_dir: str, absolute_path: str = "") -> Context:
         'filter_plugins',
         AnsibleJinja2Filter
     )
-    
+
     # In ansible >= 12, JinjaPluginIntercept signature changed
     # Old: JinjaPluginIntercept(delegatee, pluginloader)
     # New: JinjaPluginIntercept(jinja_builtins, plugin_loader)
@@ -234,13 +305,17 @@ def setup_run(root_dir: str, absolute_path: str = "") -> Context:
     # itself uses to create JinjaPluginIntercept instances (see ansible/_internal/_templating/_jinja_bits.py)
     if ANSIBLE_12_PLUS:
         # Use jinja2 defaults for builtins, wrapped by the loader
-        builtin_filters = filter_loader._wrap_funcs(jinja2_defaults.DEFAULT_FILTERS, {})
-        builtin_tests = test_loader._wrap_funcs(jinja2_defaults.DEFAULT_TESTS, {})
-        jinja_env.filters = JinjaPluginIntercept(builtin_filters, filter_loader)
+        builtin_filters = filter_loader._wrap_funcs(
+            jinja2_defaults.DEFAULT_FILTERS, {})
+        builtin_tests = test_loader._wrap_funcs(
+            jinja2_defaults.DEFAULT_TESTS, {})
+        jinja_env.filters = JinjaPluginIntercept(
+            builtin_filters, filter_loader)
         jinja_env.tests = JinjaPluginIntercept(builtin_tests, test_loader)
     else:
         # Use jinja_env's own filters/tests as delegatee
-        jinja_env.filters = JinjaPluginIntercept(jinja_env.filters, filter_loader)
+        jinja_env.filters = JinjaPluginIntercept(
+            jinja_env.filters, filter_loader)
         jinja_env.tests = JinjaPluginIntercept(jinja_env.tests, test_loader)
 
     # Setup context
